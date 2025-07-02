@@ -24,6 +24,19 @@ interface ContextMenuData {
   index: number;
 }
 
+// Undo/Redo history interfaces
+interface HistoryState {
+  matrix: MatrixData;
+  activeCell: CellPosition;
+  selectedRange: SelectionRange;
+  selectionMode: 'single' | 'range';
+  currentCellContent: string;
+  symmetricMode: boolean;
+  showZeros: boolean;
+  timestamp: number;
+  actionType: string;
+}
+
 // KaTeX の型定義を拡張
 declare global {
   interface Window {
@@ -65,6 +78,15 @@ const LaTeXMatrixEditor: React.FC = () => {
   const [showHelp, setShowHelp] = useState(false);
   const [showZeros, setShowZeros] = useState(true);
 
+  // Undo/Redo history state
+  const [history, setHistory] = useState<HistoryState[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const [isUndoRedoOperation, setIsUndoRedoOperation] = useState(false);
+  
+  // セル編集開始時の値を記録
+  const [editStartValue, setEditStartValue] = useState<string>('');
+  const [isEditing, setIsEditing] = useState(false);
+
   // コンテキストメニュー
   const [contextMenu, setContextMenu] = useState<ContextMenuData | null>(null);
 
@@ -76,6 +98,145 @@ const LaTeXMatrixEditor: React.FC = () => {
   const previewRef = useRef<HTMLDivElement>(null);
   const tableRef = useRef<HTMLTableElement>(null);
   const cellEditorRef = useRef<HTMLInputElement>(null);
+
+  // Initialize history with initial state
+  useEffect(() => {
+    if (history.length === 0 && !isUndoRedoOperation) {
+      const initialState: HistoryState = {
+        matrix: JSON.parse(JSON.stringify(matrix)),
+        activeCell: { ...activeCell },
+        selectedRange: {
+          start: { ...selectedRange.start },
+          end: { ...selectedRange.end }
+        },
+        selectionMode,
+        currentCellContent,
+        symmetricMode,
+        showZeros,
+        timestamp: Date.now(),
+        actionType: 'Initial state'
+      };
+      setHistory([initialState]);
+      setHistoryIndex(0);
+    }
+  }, []);
+
+  // Function to save current state to history
+  const saveToHistory = (actionType: string) => {
+    if (isUndoRedoOperation) return; // Don't save history during undo/redo operations
+    
+    const currentState: HistoryState = {
+      matrix: JSON.parse(JSON.stringify(matrix)), // Deep copy
+      activeCell: { ...activeCell },
+      selectedRange: {
+        start: { ...selectedRange.start },
+        end: { ...selectedRange.end }
+      },
+      selectionMode,
+      currentCellContent,
+      symmetricMode,
+      showZeros,
+      timestamp: Date.now(),
+      actionType
+    };
+
+    setHistory((prev: HistoryState[]) => {
+      // Remove any history after current index (when user made changes after undo)
+      const newHistory = prev.slice(0, historyIndex + 1);
+      newHistory.push(currentState);
+      
+      // Limit history to last 50 operations to prevent memory issues
+      if (newHistory.length > 50) {
+        newHistory.shift();
+        setHistoryIndex(Math.min(historyIndex, 48)); // Adjust index when shifting
+        return newHistory;
+      }
+      
+      // Update historyIndex to point to the new last item
+      setHistoryIndex(newHistory.length - 1);
+      return newHistory;
+    });
+  };
+
+  // Undo function
+  const undo = () => {
+    if (historyIndex <= 0) return; // Can't undo further
+    
+    // 現在編集中の場合は編集を完了してから履歴操作
+    if (isEditing) {
+      finishCellEdit();
+    }
+    
+    const targetIndex = historyIndex - 1;
+    const targetState = history[targetIndex];
+    
+    if (!targetState) return;
+    
+    setIsUndoRedoOperation(true);
+    
+    // Restore state
+    setMatrix(targetState.matrix);
+    setActiveCell(targetState.activeCell);
+    setSelectedRange(targetState.selectedRange);
+    setSelectionMode(targetState.selectionMode);
+    setCurrentCellContent(targetState.currentCellContent);
+    setSymmetricMode(targetState.symmetricMode);
+    setShowZeros(targetState.showZeros);
+    setIsEditing(false); // 編集状態をリセット
+    
+    setHistoryIndex(targetIndex);
+    
+    // Reset the flag and re-render after state updates
+    setTimeout(() => {
+      setIsUndoRedoOperation(false);
+      if (window.katex) {
+        renderAllCells();
+        generateLatex();
+      }
+    }, 100);
+  };
+
+  // Redo function
+  const redo = () => {
+    if (historyIndex >= history.length - 1) return; // Can't redo further
+    
+    // 現在編集中の場合は編集を完了してから履歴操作
+    if (isEditing) {
+      finishCellEdit();
+    }
+    
+    const targetIndex = historyIndex + 1;
+    const targetState = history[targetIndex];
+    
+    if (!targetState) return;
+    
+    setIsUndoRedoOperation(true);
+    
+    // Restore state
+    setMatrix(targetState.matrix);
+    setActiveCell(targetState.activeCell);
+    setSelectedRange(targetState.selectedRange);
+    setSelectionMode(targetState.selectionMode);
+    setCurrentCellContent(targetState.currentCellContent);
+    setSymmetricMode(targetState.symmetricMode);
+    setShowZeros(targetState.showZeros);
+    setIsEditing(false); // 編集状態をリセット
+    
+    setHistoryIndex(targetIndex);
+    
+    // Reset the flag and re-render after state updates
+    setTimeout(() => {
+      setIsUndoRedoOperation(false);
+      if (window.katex) {
+        renderAllCells();
+        generateLatex();
+      }
+    }, 100);
+  };
+
+  // Check if undo/redo is available
+  const canUndo = historyIndex > 0;
+  const canRedo = historyIndex < history.length - 1;
 
   // KaTeX動的ロード
   useEffect(() => {
@@ -105,6 +266,9 @@ const LaTeXMatrixEditor: React.FC = () => {
 
   // アクティブセル変更時に編集ボックスの内容を更新
   useEffect(() => {
+    // 前のセルの編集を完了
+    finishCellEdit();
+    
     if (matrix.cells[activeCell.row] && matrix.cells[activeCell.row][activeCell.col] !== undefined) {
       setCurrentCellContent(matrix.cells[activeCell.row][activeCell.col]);
     }
@@ -152,6 +316,18 @@ const LaTeXMatrixEditor: React.FC = () => {
           case 'a':
             e.preventDefault();
             selectAllCells();
+            break;
+          case 'z':
+            e.preventDefault();
+            if (e.shiftKey) {
+              redo(); // Ctrl+Shift+Z for redo
+            } else {
+              undo(); // Ctrl+Z for undo
+            }
+            break;
+          case 'y':
+            e.preventDefault();
+            redo(); // Ctrl+Y for redo
             break;
         }
       }
@@ -252,6 +428,8 @@ const LaTeXMatrixEditor: React.FC = () => {
   const pasteClipboardData = () => {
     if (!clipboardData) return;
 
+    saveToHistory('Paste clipboard data');
+
     const startRow = activeCell.row;
     const startCol = activeCell.col;
     const newCells = [...matrix.cells];
@@ -296,6 +474,8 @@ const LaTeXMatrixEditor: React.FC = () => {
 
   // 行を任意の位置に挿入
   const insertRowAt = (index: number, before: boolean = false) => {
+    saveToHistory(`Insert row ${before ? 'before' : 'after'} row ${index + 1}`);
+    
     const insertIndex = before ? index : index + 1;
     const newRow = Array(matrix.cols).fill('');
     const newCells = [...matrix.cells];
@@ -315,6 +495,8 @@ const LaTeXMatrixEditor: React.FC = () => {
 
   // 列を任意の位置に挿入
   const insertColAt = (index: number, before: boolean = false) => {
+    saveToHistory(`Insert column ${before ? 'before' : 'after'} column ${index + 1}`);
+    
     const insertIndex = before ? index : index + 1;
     const newCells = matrix.cells.map(row => {
       const newRow = [...row];
@@ -338,6 +520,8 @@ const LaTeXMatrixEditor: React.FC = () => {
   const deleteRowAt = (index: number) => {
     if (matrix.rows <= 1) return;
 
+    saveToHistory(`Delete row ${index + 1}`);
+
     const newCells = matrix.cells.filter((_, i) => i !== index);
     setMatrix(prev => ({
       ...prev,
@@ -354,6 +538,8 @@ const LaTeXMatrixEditor: React.FC = () => {
   // 列を削除
   const deleteColAt = (index: number) => {
     if (matrix.cols <= 1) return;
+
+    saveToHistory(`Delete column ${index + 1}`);
 
     const newCells = matrix.cells.map(row => row.filter((_, j) => j !== index));
     setMatrix(prev => ({
@@ -415,6 +601,8 @@ const LaTeXMatrixEditor: React.FC = () => {
         }
         return row;
       });
+      
+      saveToHistory('Import LaTeX matrix');
       
       // 状態を更新
       setMatrix({
@@ -582,7 +770,7 @@ const LaTeXMatrixEditor: React.FC = () => {
     }
   };
 
-  // セル値更新
+  // セル値更新（履歴保存なし - 編集完了時に別途保存）
   const updateCell = (row: number, col: number, value: string) => {
     const newCells = matrix.cells.map((r, i) => 
       r.map((c, j) => (i === row && j === col) ? value : c)
@@ -590,8 +778,29 @@ const LaTeXMatrixEditor: React.FC = () => {
     setMatrix(prev => ({ ...prev, cells: newCells }));
   };
 
+  // セル編集開始
+  const startCellEdit = () => {
+    if (!isEditing) {
+      setEditStartValue(currentCellContent);
+      setIsEditing(true);
+    }
+  };
+
+  // セル編集完了（履歴保存）
+  const finishCellEdit = () => {
+    if (isEditing && editStartValue !== currentCellContent) {
+      saveToHistory(`Edit cell (${activeCell.row + 1}, ${activeCell.col + 1})`);
+    }
+    setIsEditing(false);
+  };
+
   // 現在のセル内容を更新（対称行列モード対応）
   const updateCurrentCell = (value: string) => {
+    // 編集開始の検出
+    if (!isEditing) {
+      startCellEdit();
+    }
+    
     setCurrentCellContent(value);
     
     // 通常の更新
@@ -625,11 +834,15 @@ const LaTeXMatrixEditor: React.FC = () => {
 
   // 行列タイプ変更
   const changeMatrixType = (type: string) => {
-    setMatrix(prev => ({ ...prev, type }));
+    if (matrix.type !== type) {
+      saveToHistory(`Change matrix type to ${type}`);
+      setMatrix(prev => ({ ...prev, type }));
+    }
   };
 
   // 対称行列モード切り替え
   const toggleSymmetricMode = () => {
+    saveToHistory(`Toggle symmetric mode ${!symmetricMode ? 'on' : 'off'}`);
     setSymmetricMode(prev => !prev);
   };
 
@@ -639,6 +852,8 @@ const LaTeXMatrixEditor: React.FC = () => {
       alert('対称行列は正方行列である必要があります');
       return;
     }
+    
+    saveToHistory('Make matrix symmetric');
     
     const newCells = matrix.cells.map((row, i) => 
       row.map((cell, j) => {
@@ -847,6 +1062,42 @@ const LaTeXMatrixEditor: React.FC = () => {
             
             
 
+            {/* Undo/Redo Controls */}
+            <div>
+              <label className="block text-sm font-medium text-gray-600 mb-2">
+                History Controls
+              </label>
+              <div className="flex gap-2 flex-wrap items-center">
+                <button 
+                  onClick={undo}
+                  disabled={!canUndo}
+                  className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                    canUndo
+                      ? 'bg-blue-500 text-white hover:bg-blue-600' 
+                      : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                  }`}
+                  title="Undo (Ctrl+Z)"
+                >
+                  ↶ Undo
+                </button>
+                <button 
+                  onClick={redo}
+                  disabled={!canRedo}
+                  className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                    canRedo
+                      ? 'bg-blue-500 text-white hover:bg-blue-600' 
+                      : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                  }`}
+                  title="Redo (Ctrl+Y or Ctrl+Shift+Z)"
+                >
+                  ↷ Redo
+                </button>
+                <span className="text-xs text-gray-500">
+                  {historyIndex >= 0 && history[historyIndex] ? history[historyIndex].actionType : 'No history'}
+                </span>
+              </div>
+            </div>
+
             {/* Display Options */}
             <div>
               <label className="block text-sm font-medium text-gray-600 mb-2">
@@ -854,7 +1105,10 @@ const LaTeXMatrixEditor: React.FC = () => {
               </label>
               <div className="flex gap-2 flex-wrap items-center">
                 <button 
-                  onClick={() => setShowZeros(!showZeros)}
+                  onClick={() => {
+                    saveToHistory(`Toggle show zeros ${!showZeros ? 'on' : 'off'}`);
+                    setShowZeros(!showZeros);
+                  }}
                   className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
                     showZeros 
                       ? 'bg-green-500 text-white' 
@@ -1085,11 +1339,22 @@ const LaTeXMatrixEditor: React.FC = () => {
               type="text"
               value={currentCellContent}
               onChange={(e) => updateCurrentCell(e.target.value)}
+              onFocus={() => startCellEdit()}
+              onBlur={() => finishCellEdit()}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === 'Escape') {
+                if (e.key === 'Enter') {
                   e.preventDefault();
+                  finishCellEdit(); // 編集完了として履歴保存
                   e.currentTarget.blur(); // フォーカスを外す
                   // アクティブセルにフォーカスを戻す
+                  focusCell(activeCell.row, activeCell.col);
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  // Escapeの場合は変更を破棄
+                  setCurrentCellContent(editStartValue);
+                  updateCell(activeCell.row, activeCell.col, editStartValue);
+                  setIsEditing(false);
+                  e.currentTarget.blur();
                   focusCell(activeCell.row, activeCell.col);
                 }
               }}
@@ -1115,9 +1380,10 @@ const LaTeXMatrixEditor: React.FC = () => {
                   <p>• <strong>Selection:</strong> Click cells to select, drag to select range, Ctrl+click for multi-select</p>
                   <p>• <strong>Table Operations:</strong> Use +/- buttons on row/column headers for insertion/deletion</p>
                   <p>• <strong>Context Menu:</strong> Right-click for additional operations</p>
-                  <p>• <strong>Keyboard Shortcuts:</strong> Ctrl+C/V for copy/paste, Ctrl+A for select all (when table is focused)</p>
+                  <p>• <strong>Keyboard Shortcuts:</strong> Ctrl+C/V for copy/paste, Ctrl+A for select all, Ctrl+Z/Y for undo/redo (when table is focused)</p>
                   <p>• <strong>Navigation:</strong> Tab/Shift+Tab and arrow keys for cell navigation</p>
                   <p>• <strong>Symmetric Mode:</strong> Enable for automatic symmetric matrix editing</p>
+                  <p>• <strong>Undo/Redo:</strong> Track all changes including cell edits, row/column operations, and type changes</p>
                 </div>
               </div>
             </div>
