@@ -24,6 +24,17 @@ interface ContextMenuData {
   index: number;
 }
 
+interface HistoryEntry {
+  matrix: MatrixData;
+  activeCell: CellPosition;
+  timestamp: number;
+}
+
+interface UndoRedoState {
+  history: HistoryEntry[];
+  currentIndex: number;
+}
+
 // KaTeX の型定義を拡張
 declare global {
   interface Window {
@@ -58,12 +69,32 @@ const LaTeXMatrixEditor: React.FC = () => {
 
   // その他の状態
   const [currentCellContent, setCurrentCellContent] = useState('a_{11}');
+  const [originalCellContent, setOriginalCellContent] = useState('a_{11}');
   const [latexCode, setLatexCode] = useState('');
   const [copySuccess, setCopySuccess] = useState(false);
   const [parseError, setParseError] = useState('');
   const [symmetricMode, setSymmetricMode] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showZeros, setShowZeros] = useState(true);
+  const [isEscapePressed, setIsEscapePressed] = useState(false);
+
+  const [undoRedoState, setUndoRedoState] = useState<UndoRedoState>({
+    history: [{
+      matrix: {
+        type: 'pmatrix',
+        rows: 3,
+        cols: 3,
+        cells: [
+          ['a_{11}', 'a_{12}', 'a_{13}'],
+          ['a_{21}', 'a_{22}', 'a_{23}'],
+          ['a_{31}', 'a_{32}', 'a_{33}']
+        ]
+      },
+      activeCell: { row: 0, col: 0 },
+      timestamp: Date.now()
+    }],
+    currentIndex: 0
+  });
 
   // コンテキストメニュー
   const [contextMenu, setContextMenu] = useState<ContextMenuData | null>(null);
@@ -106,16 +137,13 @@ const LaTeXMatrixEditor: React.FC = () => {
   // アクティブセル変更時に編集ボックスの内容を更新
   useEffect(() => {
     if (matrix.cells[activeCell.row] && matrix.cells[activeCell.row][activeCell.col] !== undefined) {
-      setCurrentCellContent(matrix.cells[activeCell.row][activeCell.col]);
+      const cellValue = matrix.cells[activeCell.row][activeCell.col];
+      setCurrentCellContent(cellValue);
+      setOriginalCellContent(cellValue);
     }
   }, [activeCell, matrix.cells]);
 
-  // セル内容変更時の個別レンダリング
-  useEffect(() => {
-    if (window.katex) {
-      renderCellContent(activeCell.row, activeCell.col, currentCellContent);
-    }
-  }, [currentCellContent]);
+  // セル内容変更時の個別レンダリング（編集確定時のみ）
 
   // ゼロ表示切り替え時の再レンダリング
   useEffect(() => {
@@ -125,41 +153,6 @@ const LaTeXMatrixEditor: React.FC = () => {
     }
   }, [showZeros]);
 
-  // キーボードイベントリスナー（行列テーブルにフォーカスがある場合のみ）
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // 行列テーブルまたはその子要素にフォーカスがある場合のみ処理
-      const activeElement = document.activeElement;
-      const isMatrixFocused = activeElement && (
-        activeElement.closest('.matrix-table') || 
-        activeElement.classList.contains('matrix-cell') ||
-        activeElement.tagName === 'TD' ||
-        activeElement.tagName === 'DIV' && activeElement.closest('.matrix-table')
-      );
-      
-      if (!isMatrixFocused) return;
-      
-      if (e.ctrlKey || e.metaKey) {
-        switch (e.key) {
-          case 'c':
-            e.preventDefault();
-            copySelectedCells();
-            break;
-          case 'v':
-            e.preventDefault();
-            pasteClipboardData();
-            break;
-          case 'a':
-            e.preventDefault();
-            selectAllCells();
-            break;
-        }
-      }
-    };
-
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [selectedRange, clipboardData]);
 
   // コンテキストメニューを閉じる
   useEffect(() => {
@@ -286,12 +279,15 @@ const LaTeXMatrixEditor: React.FC = () => {
       });
     });
 
-    setMatrix(prev => ({
-      ...prev,
+    const newMatrix = {
+      ...matrix,
       rows: newCells.length,
       cols: Math.max(...newCells.map(row => row.length)),
       cells: newCells
-    }));
+    };
+
+    setMatrix(newMatrix);
+    addToHistory(newMatrix, activeCell);
   };
 
   // 行を任意の位置に挿入
@@ -301,16 +297,19 @@ const LaTeXMatrixEditor: React.FC = () => {
     const newCells = [...matrix.cells];
     newCells.splice(insertIndex, 0, newRow);
 
-    setMatrix(prev => ({
-      ...prev,
-      rows: prev.rows + 1,
+    const newMatrix = {
+      ...matrix,
+      rows: matrix.rows + 1,
       cells: newCells
-    }));
+    };
 
-    // アクティブセルを調整
-    if (activeCell.row >= insertIndex) {
-      setActiveCell(prev => ({ ...prev, row: prev.row + 1 }));
-    }
+    const newActiveCell = activeCell.row >= insertIndex 
+      ? { ...activeCell, row: activeCell.row + 1 }
+      : activeCell;
+
+    setMatrix(newMatrix);
+    setActiveCell(newActiveCell);
+    addToHistory(newMatrix, newActiveCell);
   };
 
   // 列を任意の位置に挿入
@@ -322,16 +321,19 @@ const LaTeXMatrixEditor: React.FC = () => {
       return newRow;
     });
 
-    setMatrix(prev => ({
-      ...prev,
-      cols: prev.cols + 1,
+    const newMatrix = {
+      ...matrix,
+      cols: matrix.cols + 1,
       cells: newCells
-    }));
+    };
 
-    // アクティブセルを調整
-    if (activeCell.col >= insertIndex) {
-      setActiveCell(prev => ({ ...prev, col: prev.col + 1 }));
-    }
+    const newActiveCell = activeCell.col >= insertIndex 
+      ? { ...activeCell, col: activeCell.col + 1 }
+      : activeCell;
+
+    setMatrix(newMatrix);
+    setActiveCell(newActiveCell);
+    addToHistory(newMatrix, newActiveCell);
   };
 
   // 行を削除
@@ -339,16 +341,21 @@ const LaTeXMatrixEditor: React.FC = () => {
     if (matrix.rows <= 1) return;
 
     const newCells = matrix.cells.filter((_, i) => i !== index);
-    setMatrix(prev => ({
-      ...prev,
-      rows: prev.rows - 1,
+    const newMatrix = {
+      ...matrix,
+      rows: matrix.rows - 1,
       cells: newCells
-    }));
+    };
 
-    // アクティブセルを調整
-    if (activeCell.row >= index && activeCell.row > 0) {
-      setActiveCell(prev => ({ ...prev, row: prev.row - 1 }));
-    }
+    const newActiveCell = activeCell.row >= index && activeCell.row > 0
+      ? { ...activeCell, row: activeCell.row - 1 }
+      : activeCell.row >= newMatrix.rows
+      ? { ...activeCell, row: newMatrix.rows - 1 }
+      : activeCell;
+
+    setMatrix(newMatrix);
+    setActiveCell(newActiveCell);
+    addToHistory(newMatrix, newActiveCell);
   };
 
   // 列を削除
@@ -356,16 +363,21 @@ const LaTeXMatrixEditor: React.FC = () => {
     if (matrix.cols <= 1) return;
 
     const newCells = matrix.cells.map(row => row.filter((_, j) => j !== index));
-    setMatrix(prev => ({
-      ...prev,
-      cols: prev.cols - 1,
+    const newMatrix = {
+      ...matrix,
+      cols: matrix.cols - 1,
       cells: newCells
-    }));
+    };
 
-    // アクティブセルを調整
-    if (activeCell.col >= index && activeCell.col > 0) {
-      setActiveCell(prev => ({ ...prev, col: prev.col - 1 }));
-    }
+    const newActiveCell = activeCell.col >= index && activeCell.col > 0
+      ? { ...activeCell, col: activeCell.col - 1 }
+      : activeCell.col >= newMatrix.cols
+      ? { ...activeCell, col: newMatrix.cols - 1 }
+      : activeCell;
+
+    setMatrix(newMatrix);
+    setActiveCell(newActiveCell);
+    addToHistory(newMatrix, newActiveCell);
   };
 
   // コンテキストメニューを表示
@@ -582,20 +594,11 @@ const LaTeXMatrixEditor: React.FC = () => {
     }
   };
 
-  // セル値更新
-  const updateCell = (row: number, col: number, value: string) => {
-    const newCells = matrix.cells.map((r, i) => 
-      r.map((c, j) => (i === row && j === col) ? value : c)
-    );
-    setMatrix(prev => ({ ...prev, cells: newCells }));
-  };
-
   // 現在のセル内容を更新（対称行列モード対応）
   const updateCurrentCell = (value: string) => {
     setCurrentCellContent(value);
     
-    // 通常の更新
-    updateCell(activeCell.row, activeCell.col, value);
+    let newCells;
     
     // 対称行列モードが有効で、正方行列で、非対角成分の場合
     if (symmetricMode && 
@@ -605,14 +608,13 @@ const LaTeXMatrixEditor: React.FC = () => {
         activeCell.row < matrix.cols) {
       
       // 対称位置も更新
-      const newCells = matrix.cells.map((r, i) => 
+      newCells = matrix.cells.map((r, i) => 
         r.map((c, j) => {
           if (i === activeCell.row && j === activeCell.col) return value;
-          if (i === activeCell.col && j === activeCell.row) return value; // 対称位置
+          if (i === activeCell.col && j === activeCell.row) return value;
           return c;
         })
       );
-      setMatrix(prev => ({ ...prev, cells: newCells }));
       
       // 対称位置のセルも再レンダリング
       setTimeout(() => {
@@ -620,12 +622,35 @@ const LaTeXMatrixEditor: React.FC = () => {
           renderCellContent(activeCell.col, activeCell.row, value);
         }
       }, 0);
+    } else {
+      // 通常の更新
+      newCells = matrix.cells.map((r, i) => 
+        r.map((c, j) => (i === activeCell.row && j === activeCell.col) ? value : c)
+      );
+    }
+    
+    const newMatrix = { ...matrix, cells: newCells };
+    setMatrix(newMatrix);
+  };
+
+  const commitCellEdit = (value: string) => {
+    updateCurrentCell(value);
+    const newCells = matrix.cells.map((r, i) => 
+      r.map((c, j) => (i === activeCell.row && j === activeCell.col) ? value : c)
+    );
+    const newMatrix = { ...matrix, cells: newCells };
+    addToHistory(newMatrix, activeCell);
+    
+    if (window.katex) {
+      renderCellContent(activeCell.row, activeCell.col, value);
     }
   };
 
   // 行列タイプ変更
   const changeMatrixType = (type: string) => {
-    setMatrix(prev => ({ ...prev, type }));
+    const newMatrix = { ...matrix, type };
+    setMatrix(newMatrix);
+    addToHistory(newMatrix, activeCell);
   };
 
   // 対称行列モード切り替え
@@ -652,7 +677,9 @@ const LaTeXMatrixEditor: React.FC = () => {
       })
     );
     
-    setMatrix(prev => ({ ...prev, cells: newCells }));
+    const newMatrix = { ...matrix, cells: newCells };
+    setMatrix(newMatrix);
+    addToHistory(newMatrix, activeCell);
     
     // 現在のセルの内容も更新
     setCurrentCellContent(newCells[activeCell.row][activeCell.col] || '');
@@ -781,6 +808,65 @@ const LaTeXMatrixEditor: React.FC = () => {
     return !isNaN(numValue) && numValue === 0;
   };
 
+  const addToHistory = (newMatrix: MatrixData, newActiveCell: CellPosition) => {
+    setUndoRedoState(prev => {
+      const newHistory = prev.history.slice(0, prev.currentIndex + 1);
+      newHistory.push({
+        matrix: newMatrix,
+        activeCell: newActiveCell,
+        timestamp: Date.now()
+      });
+      
+      if (newHistory.length > 50) {
+        newHistory.shift();
+        return {
+          history: newHistory,
+          currentIndex: newHistory.length - 1
+        };
+      }
+      
+      return {
+        history: newHistory,
+        currentIndex: newHistory.length - 1
+      };
+    });
+  };
+
+  const undo = () => {
+    if (undoRedoState.currentIndex > 0) {
+      const newIndex = undoRedoState.currentIndex - 1;
+      const historyEntry = undoRedoState.history[newIndex];
+      
+      setMatrix(historyEntry.matrix);
+      setActiveCell(historyEntry.activeCell);
+      setCurrentCellContent(historyEntry.matrix.cells[historyEntry.activeCell.row][historyEntry.activeCell.col]);
+      setUndoRedoState(prev => ({ ...prev, currentIndex: newIndex }));
+      
+      if (cellEditorRef.current) {
+        cellEditorRef.current.blur();
+      }
+    }
+  };
+
+  const redo = () => {
+    if (undoRedoState.currentIndex < undoRedoState.history.length - 1) {
+      const newIndex = undoRedoState.currentIndex + 1;
+      const historyEntry = undoRedoState.history[newIndex];
+      
+      setMatrix(historyEntry.matrix);
+      setActiveCell(historyEntry.activeCell);
+      setCurrentCellContent(historyEntry.matrix.cells[historyEntry.activeCell.row][historyEntry.activeCell.col]);
+      setUndoRedoState(prev => ({ ...prev, currentIndex: newIndex }));
+      
+      if (cellEditorRef.current) {
+        cellEditorRef.current.blur();
+      }
+    }
+  };
+
+  const canUndo = undoRedoState.currentIndex > 0;
+  const canRedo = undoRedoState.currentIndex < undoRedoState.history.length - 1;
+
   // コピー機能
   const copyToClipboard = () => {
     navigator.clipboard.writeText(latexCode).then(() => {
@@ -788,6 +874,70 @@ const LaTeXMatrixEditor: React.FC = () => {
       setTimeout(() => setCopySuccess(false), 2000);
     });
   };
+
+  // キーボードイベントリスナー（行列テーブルにフォーカスがある場合のみ）
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const activeElement = document.activeElement as HTMLElement;
+      if (!activeElement) return;
+      
+      const isInCellEditor = cellEditorRef.current && activeElement === cellEditorRef.current;
+      const isInLatexTextarea = activeElement.tagName.toLowerCase() === 'textarea' && 
+                               activeElement.className.includes('font-mono');
+      const isInOtherInput = activeElement.tagName.toLowerCase() === 'input' || 
+                            activeElement.tagName.toLowerCase() === 'textarea' ||
+                            activeElement.contentEditable === 'true';
+      
+      if (isInCellEditor || isInLatexTextarea) return;
+      
+      if (isInOtherInput) return;
+      
+      const matrixEditor = document.querySelector('.latex-matrix-editor');
+      const isInMatrixEditor = matrixEditor && (
+        matrixEditor.contains(activeElement) ||
+        activeElement.closest('.latex-matrix-editor')
+      );
+      
+      if (!isInMatrixEditor) return;
+      
+      if (e.ctrlKey || e.metaKey) {
+        switch (e.key) {
+          case 'c':
+            e.preventDefault();
+            e.stopPropagation();
+            copySelectedCells();
+            break;
+          case 'v':
+            e.preventDefault();
+            e.stopPropagation();
+            pasteClipboardData();
+            break;
+          case 'a':
+            e.preventDefault();
+            e.stopPropagation();
+            selectAllCells();
+            break;
+          case 'z':
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.shiftKey) {
+              redo();
+            } else {
+              undo();
+            }
+            break;
+          case 'y':
+            e.preventDefault();
+            e.stopPropagation();
+            redo();
+            break;
+        }
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => document.removeEventListener('keydown', handleKeyDown, true);
+  }, [selectedRange, clipboardData, undo, redo, copySelectedCells, pasteClipboardData, selectAllCells]);
 
   return (
     <div className="max-w-7xl mx-auto p-6 bg-gray-50 min-h-screen">
@@ -828,6 +978,39 @@ const LaTeXMatrixEditor: React.FC = () => {
                 <option value="Vmatrix">Vmatrix || ||</option>
                 <option value="smallmatrix">smallmatrix</option>
               </select>
+            </div>
+            
+            {/* Undo/Redo Controls */}
+            <div>
+              <label className="block text-sm font-medium text-gray-600 mb-2">
+                Undo/Redo
+              </label>
+              <div className="flex gap-2">
+                <button
+                  onClick={undo}
+                  disabled={!canUndo}
+                  className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                    canUndo
+                      ? 'bg-blue-500 text-white hover:bg-blue-600'
+                      : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                  }`}
+                  title="Undo (Ctrl+Z)"
+                >
+                  ↶ Undo
+                </button>
+                <button
+                  onClick={redo}
+                  disabled={!canRedo}
+                  className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                    canRedo
+                      ? 'bg-blue-500 text-white hover:bg-blue-600'
+                      : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                  }`}
+                  title="Redo (Ctrl+Y or Ctrl+Shift+Z)"
+                >
+                  ↷ Redo
+                </button>
+              </div>
             </div>
             
             {/* Matrix Info */}
@@ -1086,11 +1269,36 @@ const LaTeXMatrixEditor: React.FC = () => {
               value={currentCellContent}
               onChange={(e) => updateCurrentCell(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === 'Escape') {
+                if (e.key === 'Enter') {
                   e.preventDefault();
+                  commitCellEdit(currentCellContent);
                   e.currentTarget.blur(); // フォーカスを外す
                   // アクティブセルにフォーカスを戻す
                   focusCell(activeCell.row, activeCell.col);
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setIsEscapePressed(true);
+                  setCurrentCellContent(originalCellContent);
+                  
+                  const newCells = matrix.cells.map((row, rowIndex) =>
+                    row.map((cell, colIndex) =>
+                      rowIndex === activeCell.row && colIndex === activeCell.col
+                        ? originalCellContent
+                        : cell
+                    )
+                  );
+                  setMatrix({ ...matrix, cells: newCells });
+                  
+                  e.currentTarget.blur(); // フォーカスを外す
+                  // アクティブセルにフォーカスを戻す
+                  focusCell(activeCell.row, activeCell.col);
+                  
+                  setTimeout(() => setIsEscapePressed(false), 100);
+                }
+              }}
+              onBlur={() => {
+                if (!isEscapePressed) {
+                  commitCellEdit(currentCellContent);
                 }
               }}
               className="w-full p-3 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono"
